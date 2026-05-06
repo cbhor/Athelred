@@ -1,0 +1,6 @@
+{
+  "name": "Aura Exam Generator",
+  "description": "A local-first AI-powered MCQ exam generator from EPUB files.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
