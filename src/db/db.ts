@@ -88,6 +88,9 @@ export interface Settings {
   openaiApiKey: string;
   openaiBaseUrl: string;
   selectedModel: string;
+  embeddingProvider: string;
+  embeddingModel: string;
+  embeddingApiKey: string;
   defaultPassPercent: number;
   defaultSessionDurationMinutes: number;
   defaultQuestionCount: number;
@@ -127,6 +130,9 @@ export async function initializeSettings() {
         openaiApiKey: '',
         openaiBaseUrl: 'https://api.openai.com/v1',
         selectedModel: 'gemini-1.5-flash',
+        embeddingProvider: 'gemini',
+        embeddingModel: 'embedding-001',
+        embeddingApiKey: '',
         defaultPassPercent: 60,
         defaultSessionDurationMinutes: 180,
         defaultQuestionCount: 100,

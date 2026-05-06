@@ -50,6 +50,20 @@ export const api = {
     }),
   },
 
+  search: {
+    semantic: (workspaceId: number, query: string, limit?: number) => request<any[]>('/search/semantic', {
+      method: 'POST',
+      body: JSON.stringify({ workspaceId, query, limit }),
+    }),
+  },
+
+  embeddings: {
+    batch: (texts: string[]) => request<{ embeddings: number[][] }>('/embeddings/batch', {
+      method: 'POST',
+      body: JSON.stringify({ texts }),
+    }),
+  },
+
   questions: {
     bulkAdd: (questions: Question[]) => request<number[]>('/questions/bulk', {
       method: 'POST',

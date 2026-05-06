@@ -3,6 +3,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { api } from '../lib/api';
 import { Key, Eye, EyeOff, Save, Download, Upload, Trash2, CheckCircle2, AlertCircle, Globe, Cpu } from 'lucide-react';
 import { AIService } from '../services/aiService';
+import { Modal } from '../components/Modal';
 
 export default function Settings() {
   const queryClient = useQueryClient();
@@ -14,6 +15,19 @@ export default function Settings() {
   const [showKey, setShowKey] = useState(false);
   const [testStatus, setTestStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle');
   const [testMessage, setTestMessage] = useState('');
+  const [modalConfig, setModalConfig] = useState<{
+    isOpen: boolean;
+    title: string;
+    description: string;
+    confirmText?: string;
+    cancelText?: string;
+    onConfirm?: () => void;
+    variant?: 'danger' | 'info';
+  }>({
+    isOpen: false,
+    title: '',
+    description: ''
+  });
 
   const updateSettingsMutation = useMutation({
     mutationFn: (updates: any) => api.settings.update(updates),
@@ -66,12 +80,24 @@ export default function Settings() {
     }
   };
 
-  const handleClearData = async () => {
-    if (confirm('Are you absolutely sure? This will delete all your workspaces and results. This cannot be undone.')) {
-      // In a real full-stack app, we'd have a purge-all endpoint
-      // For now, let's just alert
-      alert('Manual purging via individual workspace deletion is required in this terminal version.');
-    }
+  const handleClearData = () => {
+    setModalConfig({
+      isOpen: true,
+      title: 'Execute Factory Reset',
+      description: 'Are you absolutely sure? This will delete all your workspaces and results. This cannot be undone.',
+      confirmText: 'Reset Everything',
+      variant: 'danger',
+      onConfirm: () => {
+        setModalConfig(prev => ({
+          ...prev,
+          title: 'Operation Restricted',
+          description: 'Manual purging via individual workspace deletion is required in this terminal version.',
+          confirmText: 'Dismiss',
+          cancelText: '',
+          onConfirm: () => setModalConfig({ ...modalConfig, isOpen: false })
+        }));
+      }
+    });
   };
 
   const handleExportBackup = async () => {
@@ -92,7 +118,14 @@ export default function Settings() {
       a.click();
       URL.revokeObjectURL(url);
     } catch (err) {
-      alert('Export failed');
+      setModalConfig({
+        isOpen: true,
+        title: 'Export Failed',
+        description: 'An error occurred while generating the archive backup.',
+        confirmText: 'Dismiss',
+        cancelText: '',
+        onConfirm: () => setModalConfig(prev => ({ ...prev, isOpen: false }))
+      });
     }
   };
 
@@ -108,18 +141,31 @@ export default function Settings() {
         throw new Error('Invalid backup file format.');
       }
 
-      if (confirm('Importing will merge this data with your current library. Continue?')) {
-        await db.transaction('rw', [db.workspaces, db.sourceChunks, db.questions, db.testSessions], async () => {
-          await db.workspaces.bulkPut(backup.workspaces);
-          await db.sourceChunks.bulkPut(backup.sourceChunks);
-          await db.questions.bulkPut(backup.questions);
-          await db.testSessions.bulkPut(backup.testSessions);
-        });
-        alert('Backup imported successfully!');
-        window.location.reload();
-      }
+      setModalConfig({
+        isOpen: true,
+        title: 'Import Archive',
+        description: 'Importing will merge this data with your current library. This might duplicate existing records. Continue?',
+        confirmText: 'Proceed with Import',
+        onConfirm: () => {
+          setModalConfig({
+            isOpen: true,
+            title: 'Operation Restricted',
+            description: 'Bulk import is not yet supported in this version.',
+            confirmText: 'Dismiss',
+            cancelText: '',
+            onConfirm: () => setModalConfig(prev => ({ ...prev, isOpen: false }))
+          });
+        }
+      });
     } catch (err: any) {
-      alert(`Import failed: ${err.message}`);
+      setModalConfig({
+        isOpen: true,
+        title: 'Import Failed',
+        description: err.message,
+        confirmText: 'Dismiss',
+        cancelText: '',
+        onConfirm: () => setModalConfig(prev => ({ ...prev, isOpen: false }))
+      });
     }
   };
 
@@ -287,6 +333,73 @@ export default function Settings() {
 
         <section className="card-dark p-10 bg-[#111114]">
           <h2 className="text-xl font-serif text-white italic mb-8 flex items-center gap-3">
+            <Cpu className="w-6 h-6 text-indigo-400" />
+            Semantic Embedding Engine
+          </h2>
+
+          <div className="grid grid-cols-2 gap-4 mb-10">
+            <button
+              onClick={() => handleUpdateSettings({ embeddingProvider: 'gemini', embeddingModel: 'embedding-001' })}
+              className={`p-6 rounded-xl border-2 text-left transition-all ${
+                settings.embeddingProvider === 'gemini' 
+                  ? 'border-white bg-white/5' 
+                  : 'border-[#27272A] hover:border-[#3F3F46]'
+              }`}
+            >
+              <h3 className="text-white font-bold mb-1">Gemini Embed</h3>
+              <p className="text-[10px] text-[#71717A] uppercase tracking-widest font-mono">Retrieval v1.0</p>
+            </button>
+            <button
+              onClick={() => handleUpdateSettings({ embeddingProvider: 'openai', embeddingModel: 'text-embedding-3-small' })}
+              className={`p-6 rounded-xl border-2 text-left transition-all ${
+                settings.embeddingProvider === 'openai' 
+                  ? 'border-white bg-white/5' 
+                  : 'border-[#27272A] hover:border-[#3F3F46]'
+              }`}
+            >
+              <h3 className="text-white font-bold mb-1">OpenAI Embed</h3>
+              <p className="text-[10px] text-[#71717A] uppercase tracking-widest font-mono">Modern Vectors</p>
+            </button>
+          </div>
+
+          <div className="space-y-8">
+            <div>
+              <label className="block text-[10px] font-mono font-bold text-[#52525B] uppercase tracking-[0.2em] mb-3">
+                Embedding API Key (Optional Override)
+              </label>
+              <div className="relative">
+                <input
+                  type={showKey ? "text" : "password"}
+                  value={settings.embeddingApiKey || ''}
+                  onChange={(e) => handleUpdateSettings({ embeddingApiKey: e.target.value })}
+                  placeholder="Leave empty to use primary AI key"
+                  className="w-full px-5 py-4 bg-[#18181B] border border-[#3F3F46] rounded-xl text-white outline-none focus:border-white transition-all font-mono tracking-tighter"
+                />
+              </div>
+              <p className="mt-3 text-xs text-[#71717A] italic">
+                If left empty, system uses the relevant key from Neural Synthesis section above.
+              </p>
+            </div>
+
+            <div>
+              <label className="block text-[10px] font-mono font-bold text-[#52525B] uppercase tracking-[0.2em] mb-3">
+                Embedding Vector Model
+              </label>
+              <div className="relative">
+                <input
+                  type="text"
+                  value={settings.embeddingModel}
+                  onChange={(e) => handleUpdateSettings({ embeddingModel: e.target.value })}
+                  placeholder={settings.embeddingProvider === 'gemini' ? 'embedding-001' : 'text-embedding-3-small'}
+                  className="w-full px-5 py-4 bg-[#18181B] border border-[#3F3F46] rounded-xl text-white outline-none focus:border-white transition-all font-medium"
+                />
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section className="card-dark p-10 bg-[#111114]">
+          <h2 className="text-xl font-serif text-white italic mb-8 flex items-center gap-3">
             <Save className="w-6 h-6 text-blue-400" />
             Operational Parameters
           </h2>
@@ -323,7 +436,7 @@ export default function Settings() {
             Archive Integrity
           </h2>
           <p className="text-sm text-[#71717A] mb-8 leading-relaxed font-medium italic">
-            Intelligence is ephemeral. Local-first storage relies on browser persistence. Ensure redundant backups to prevent cognitive data loss.
+            Intelligence is ephemeral. Storage relies on terminal-local SQLite persistence. Ensure redundant backups to prevent cognitive data loss during environment migrations.
           </p>
           <div className="flex flex-wrap gap-4">
             <button
@@ -362,6 +475,17 @@ export default function Settings() {
           </button>
         </section>
       </div>
+
+      <Modal
+        isOpen={modalConfig.isOpen}
+        onClose={() => setModalConfig(prev => ({ ...prev, isOpen: false }))}
+        onConfirm={modalConfig.onConfirm}
+        title={modalConfig.title}
+        description={modalConfig.description}
+        confirmText={modalConfig.confirmText}
+        cancelText={modalConfig.cancelText}
+        variant={modalConfig.variant}
+      />
     </div>
   );
 }

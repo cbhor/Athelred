@@ -6,6 +6,7 @@ import { useNavigate } from 'react-router-dom';
 import ePub from 'epubjs';
 import JSZip from 'jszip';
 import { useQueryClient } from '@tanstack/react-query';
+import { Modal } from '../components/Modal';
 
 interface ParseStep {
   id: string;
@@ -24,9 +25,11 @@ export default function CreateWorkspace() {
     { id: 'file', label: 'Reading file & metadata', status: 'pending' },
     { id: 'extract', label: 'Extracting chapters', status: 'pending' },
     { id: 'chunk', label: 'Processing text chunks', status: 'pending' },
+    { id: 'embedding', label: 'Generating semantic vectors', status: 'pending' },
     { id: 'save', label: 'Saving to library', status: 'pending' },
   ]);
   const [error, setError] = useState<string | null>(null);
+  const [duplicateWorkspace, setDuplicateWorkspace] = useState<any>(null);
 
   const updateStep = (id: string, status: ParseStep['status'], message?: string) => {
     setSteps(prev => prev.map(s => s.id === id ? { ...s, status, message } : s));
@@ -55,12 +58,24 @@ export default function CreateWorkspace() {
       const existing = workspaces.find(w => w.epubHash === hash);
       
       if (existing) {
-        if (!confirm(`An EPUB with this content already exists (Workspace: ${existing.name}). Create a duplicate?`)) {
-          navigate(`/workspace/${existing.id}`);
-          return;
-        }
+        setDuplicateWorkspace(existing);
+        setIsParsing(false);
+        return;
       }
 
+      await executeParse(file);
+    } catch (err: any) {
+      console.error(err);
+      setError(err.message || 'An error occurred while parsing the EPUB.');
+      setIsParsing(false);
+    }
+  }
+
+  async function executeParse(file: File) {
+    setIsParsing(true);
+    setError(null);
+    try {
+      const hash = await calculateHash(file);
       updateStep('file', 'loading');
       const book = ePub(await file.arrayBuffer());
       const metadata = await book.loaded.metadata;
@@ -70,18 +85,38 @@ export default function CreateWorkspace() {
 
       const zip = await JSZip.loadAsync(file);
       const spine = (book as any).spine;
-      const chapters: { title: string; text: string; index: number }[] = [];
+      const toc = await book.loaded.navigation;
+      
+      // Normalize TOC for easier mapping
+      const tocHrefs = new Set<string>();
+      const tocMap = new Map<string, string>();
+      
+      const flattenToc = (items: any[]) => {
+        items.forEach(item => {
+          const href = item.href.split('#')[0];
+          tocHrefs.add(href);
+          tocMap.set(href, item.label);
+          if (item.subitems) flattenToc(item.subitems);
+        });
+      };
+      
+      if (toc && toc.toc) {
+        flattenToc(toc.toc);
+      }
 
+      const segments: { title: string; text: string; href: string; isTocStart: boolean }[] = [];
       let totalWords = 0;
       let totalChars = 0;
 
       for (let i = 0; i < spine.items.length; i++) {
         const item = spine.items[i];
         const href = item.href;
-        const zippedFile = zip.file(href.startsWith('/') ? href.slice(1) : href) || 
-                          zip.file('OEBPS/' + href) || 
-                          zip.file('OPS/' + href) ||
-                          zip.file('EPUB/' + href);
+        const normalizedHref = href.startsWith('/') ? href.slice(1) : href;
+        
+        const zippedFile = zip.file(normalizedHref) || 
+                          zip.file('OEBPS/' + normalizedHref) || 
+                          zip.file('OPS/' + normalizedHref) ||
+                          zip.file('EPUB/' + normalizedHref);
         
         if (zippedFile) {
           const content = await zippedFile.async('text');
@@ -90,16 +125,19 @@ export default function CreateWorkspace() {
           
           const body = doc.body;
           if (body) {
-            body.querySelectorAll('script, style, nav, footer').forEach(e => e.remove());
+            body.querySelectorAll('script, style, nav, footer, head').forEach(e => e.remove());
             const text = body.textContent || '';
             const cleanText = text.replace(/\s+/g, ' ').trim();
             
             if (cleanText.length > 100) {
-              const chapterTitle = doc.querySelector('h1, h2, h3, title')?.textContent || `Chapter ${i + 1}`;
-              chapters.push({
-                title: chapterTitle.trim(),
+              const isTocStart = tocHrefs.has(href) || tocHrefs.has(normalizedHref);
+              const title = tocMap.get(href) || tocMap.get(normalizedHref) || doc.querySelector('h1, h2, h3, title')?.textContent?.trim() || `Section ${i + 1}`;
+              
+              segments.push({
+                title,
                 text: cleanText,
-                index: i
+                href,
+                isTocStart
               });
               
               totalChars += cleanText.length;
@@ -109,17 +147,46 @@ export default function CreateWorkspace() {
         }
       }
 
-      if (chapters.length === 0) {
+      // Merge segments into actual chapters based on TOC markers
+      const chapters: { title: string; text: string; index: number }[] = [];
+      
+      segments.forEach((segment, idx) => {
+        // Skip metadata segments
+        const isMetadata = /cover|title|copyright|dedication|acknowledgments|author|preface/i.test(segment.title) || 
+                          (segment.text.length < 500 && idx < 3);
+
+        if (isMetadata && !segment.isTocStart) return;
+
+        if (segment.isTocStart || chapters.length === 0) {
+          chapters.push({
+            title: segment.title,
+            text: segment.text,
+            index: chapters.length
+          });
+        } else {
+          // Append to current chapter
+          const last = chapters[chapters.length - 1];
+          last.text += "\n\n" + segment.text;
+        }
+      });
+
+      // Cleanup: Final pass to ensure titles are clean
+      const finalChapters = chapters.map((c, i) => ({
+        ...c,
+        title: c.title.length > 60 ? `Chapter ${i + 1}` : c.title
+      })).filter(c => c.text.split(/\s+/).length > 100); // Remove tiny placeholder chapters
+
+      if (finalChapters.length === 0) {
         throw new Error('No readable text found in EPUB.');
       }
 
-      updateStep('extract', 'success', `${chapters.length} sections found`);
+      updateStep('extract', 'success', `${finalChapters.length} chapters identified`);
       updateStep('chunk', 'loading');
 
       const chunksData: any[] = [];
       const CHUNK_SIZE = 2500;
 
-      chapters.forEach((chapter, chapterIdx) => {
+      finalChapters.forEach((chapter, chapterIdx) => {
         const words = chapter.text.split(/\s+/);
         let chunkIdx = 0;
         
@@ -140,6 +207,18 @@ export default function CreateWorkspace() {
       });
 
       updateStep('chunk', 'success', `${chunksData.length} chunks created`);
+      updateStep('embedding', 'loading');
+
+      // Batch generate embeddings
+      const textsToEmbed = chunksData.map(c => `${c.chapterTitle}\n${c.text}`);
+      const { embeddings } = await api.embeddings.batch(textsToEmbed);
+      
+      const chunksWithEmbeddings = chunksData.map((c, i) => ({
+        ...c,
+        embedding: embeddings[i]
+      }));
+
+      updateStep('embedding', 'success', `${embeddings.length} vectors generated`);
       updateStep('save', 'loading');
 
       const { id: workspaceId } = await api.workspaces.create({
@@ -152,13 +231,13 @@ export default function CreateWorkspace() {
         epubHash: hash,
         totalCharacters: totalChars,
         totalWords: totalWords,
-        chapterCount: chapters.length,
+        chapterCount: finalChapters.length,
         chunkCount: chunksData.length,
         status: 'ready',
         parseWarnings: []
       });
 
-      const finalChunks = chunksData.map(c => ({ ...c, workspaceId }));
+      const finalChunks = chunksWithEmbeddings.map(c => ({ ...c, workspaceId }));
       await api.sourceChunks.bulkAdd(finalChunks);
 
       queryClient.invalidateQueries({ queryKey: ['workspaces'] });
@@ -273,6 +352,24 @@ export default function CreateWorkspace() {
           )}
         </div>
       </div>
+
+      <Modal
+        isOpen={!!duplicateWorkspace}
+        onClose={() => {
+          const id = duplicateWorkspace?.id;
+          setDuplicateWorkspace(null);
+          if (id) navigate(`/workspace/${id}`);
+        }}
+        onConfirm={() => {
+          const f = file;
+          setDuplicateWorkspace(null);
+          if (f) executeParse(f);
+        }}
+        title="Duplicate Found"
+        description={`An EPUB with this content already exists in workspace "${duplicateWorkspace?.name}". Would you like to create a duplicate workspace or navigate to the existing one?`}
+        confirmText="Create Duplicate"
+        cancelText="View Existing"
+      />
     </div>
   );
 }

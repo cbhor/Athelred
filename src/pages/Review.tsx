@@ -4,6 +4,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { api } from '../lib/api';
 import { Question } from '../db/db';
 import { cn } from '../lib/utils';
+import { Modal } from '../components/Modal';
 import { 
   ArrowLeft, 
   CheckCircle2, 
@@ -40,6 +41,7 @@ export default function Review() {
 
   const [currentIndex, setCurrentIndex] = useState(0);
   const [filter, setFilter] = useState<'all' | 'incorrect' | 'correct' | 'flagged'>('all');
+  const [isBadModalOpen, setIsBadModalOpen] = useState(false);
 
   const filteredQuestions = questions.filter((q) => {
     if (filter === 'all') return true;
@@ -57,7 +59,7 @@ export default function Review() {
     mutationFn: ({ qId, updates }: { qId: number, updates: Partial<Question> }) => api.questions.update(qId, updates),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['sessionQuestions', session?.id] });
-      alert('Question marked as poor quality. It will be avoided in future sessions.');
+      setIsBadModalOpen(true);
     }
   });
 
@@ -244,6 +246,14 @@ export default function Review() {
           </div>
         </div>
       )}
+      <Modal
+        isOpen={isBadModalOpen}
+        onClose={() => setIsBadModalOpen(false)}
+        title="Quality Protocol"
+        description="Question has been flagged as poor quality. The synthesis engine will avoid this node in future assessment generations."
+        confirmText="Acknowledged"
+        onConfirm={() => setIsBadModalOpen(false)}
+      />
     </div>
   );
 }

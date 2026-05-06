@@ -4,6 +4,85 @@ import path from "path";
 import fs from "fs";
 import Database from "better-sqlite3";
 import cors from "cors";
+import OpenAI from "openai";
+import { GoogleGenerativeAI } from "@google/generative-ai";
+
+// AI Utilities
+const getSettings = () => {
+  return db.prepare("SELECT * FROM settings WHERE id = 1").get() as any;
+};
+
+const getAI = () => {
+  const settings = getSettings();
+  const provider = settings.aiProvider || 'gemini';
+  
+  if (provider === 'gemini') {
+    const key = settings.geminiApiKey?.trim() || process.env.GEMINI_API_KEY?.trim();
+    if (!key) throw new Error("Gemini API Key not configured.");
+    return new GoogleGenerativeAI(key);
+  } else {
+    const key = settings.openaiApiKey?.trim() || process.env.OPENAI_API_KEY?.trim();
+    if (!key) throw new Error("OpenAI API Key not configured.");
+    return new OpenAI({
+      apiKey: key,
+      baseURL: settings.openaiBaseUrl || undefined
+    });
+  }
+};
+
+async function generateEmbeddings(texts: string[]): Promise<number[][]> {
+  const settings = getSettings();
+  const provider = settings.embeddingProvider || process.env.EMBEDDING_PROVIDER || 'gemini';
+  const modelName = settings.embeddingModel || process.env.EMBEDDING_MODEL || 'embedding-001';
+  
+  if (provider === 'gemini') {
+    const key = settings.embeddingApiKey?.trim() || settings.geminiApiKey?.trim() || process.env.EMBEDDING_API_KEY?.trim() || process.env.GEMINI_API_KEY?.trim();
+    if (!key) throw new Error("Gemini Embedding API Key not found.");
+    
+    const genAI = new GoogleGenerativeAI(key);
+    const model = genAI.getGenerativeModel({ model: modelName });
+    
+    // Batch process
+    const batchSize = 20;
+    const allEmbeddings = [];
+    for (let i = 0; i < texts.length; i += batchSize) {
+      const batch = texts.slice(i, i + batchSize);
+      const result = await model.batchEmbedContents({
+        requests: batch.map((t: string) => ({ content: { role: "user", parts: [{ text: t }] }, taskType: "RETRIEVAL_DOCUMENT" as any }))
+      });
+      allEmbeddings.push(...result.embeddings.map(e => e.values));
+    }
+    return allEmbeddings;
+  } else if (provider === 'openai') {
+    const key = settings.embeddingApiKey?.trim() || settings.openaiApiKey?.trim() || process.env.EMBEDDING_API_KEY?.trim() || process.env.OPENAI_API_KEY?.trim();
+    if (!key) throw new Error("OpenAI Embedding API Key not found.");
+    
+    const openai = new OpenAI({ apiKey: key, baseURL: settings.openaiBaseUrl || undefined });
+    const response = await openai.embeddings.create({
+      model: modelName || 'text-embedding-3-small',
+      input: texts,
+    });
+    return response.data.map(d => d.embedding);
+  }
+  
+  throw new Error(`Unsupported embedding provider: ${provider}`);
+}
+
+// Cosine Similarity Utility
+function cosineSimilarity(vecA: number[], vecB: number[]) {
+  let dotProduct = 0;
+  let mA = 0;
+  let mB = 0;
+  for (let i = 0; i < vecA.length; i++) {
+    dotProduct += vecA[i] * vecB[i];
+    mA += vecA[i] * vecA[i];
+    mB += vecB[i] * vecB[i];
+  }
+  mA = Math.sqrt(mA);
+  mB = Math.sqrt(mB);
+  if (mA === 0 || mB === 0) return 0;
+  return dotProduct / (mA * mB);
+}
 
 // Initialize Database
 const dbPath = path.join(process.cwd(), "data", "aethelred.db");
@@ -43,6 +122,7 @@ db.exec(`
     characterCount INTEGER,
     sourceLocator TEXT,
     importanceScore REAL,
+    embedding TEXT, -- JSON array of floats
     createdAt INTEGER,
     FOREIGN KEY(workspaceId) REFERENCES workspaces(id) ON DELETE CASCADE
   );
@@ -104,6 +184,9 @@ db.exec(`
     openaiApiKey TEXT,
     openaiBaseUrl TEXT,
     selectedModel TEXT,
+    embeddingProvider TEXT DEFAULT 'gemini',
+    embeddingModel TEXT DEFAULT 'embedding-001',
+    embeddingApiKey TEXT,
     defaultPassPercent INTEGER,
     defaultSessionDurationMinutes INTEGER,
     defaultQuestionCount INTEGER,
@@ -111,14 +194,28 @@ db.exec(`
   );
 `);
 
+// Migration: Ensure new columns exist in settings
+const settingsTable = db.prepare("PRAGMA table_info(settings)").all() as any[];
+const hasEmbeddingProvider = settingsTable.some(col => col.name === 'embeddingProvider');
+if (!hasEmbeddingProvider) {
+  try {
+    db.prepare("ALTER TABLE settings ADD COLUMN embeddingProvider TEXT DEFAULT 'gemini'").run();
+    db.prepare("ALTER TABLE settings ADD COLUMN embeddingModel TEXT DEFAULT 'embedding-001'").run();
+    db.prepare("ALTER TABLE settings ADD COLUMN embeddingApiKey TEXT").run();
+  } catch (e) {
+    console.error("Migration error:", e);
+  }
+}
+
 // Default Settings
 const checkSettings = db.prepare("SELECT * FROM settings WHERE id = 1").get();
 if (!checkSettings) {
   db.prepare(`
     INSERT INTO settings (
       id, aiProvider, geminiApiKey, openaiApiKey, openaiBaseUrl, selectedModel, 
+      embeddingProvider, embeddingModel, embeddingApiKey,
       defaultPassPercent, defaultSessionDurationMinutes, defaultQuestionCount, allowedOverlapPercent
-    ) VALUES (1, 'gemini', '', '', 'https://api.openai.com/v1', 'gemini-1.5-flash', 60, 180, 100, 30)
+    ) VALUES (1, 'gemini', '', '', 'https://api.openai.com/v1', 'gemini-1.5-flash', 'gemini', 'embedding-001', '', 60, 180, 100, 30)
   `).run();
 }
 
@@ -135,16 +232,19 @@ app.get("/api/settings", (req, res) => {
 app.post("/api/settings", (req, res) => {
   const { 
     aiProvider, geminiApiKey, openaiApiKey, openaiBaseUrl, selectedModel, 
+    embeddingProvider, embeddingModel, embeddingApiKey,
     defaultPassPercent, defaultSessionDurationMinutes, defaultQuestionCount, allowedOverlapPercent 
   } = req.body;
   
   db.prepare(`
     UPDATE settings SET 
       aiProvider = ?, geminiApiKey = ?, openaiApiKey = ?, openaiBaseUrl = ?, selectedModel = ?, 
+      embeddingProvider = ?, embeddingModel = ?, embeddingApiKey = ?,
       defaultPassPercent = ?, defaultSessionDurationMinutes = ?, defaultQuestionCount = ?, allowedOverlapPercent = ?
     WHERE id = 1
   `).run(
     aiProvider, geminiApiKey, openaiApiKey, openaiBaseUrl, selectedModel, 
+    embeddingProvider, embeddingModel, embeddingApiKey,
     defaultPassPercent, defaultSessionDurationMinutes, defaultQuestionCount, allowedOverlapPercent
   );
   res.json({ success: true });
@@ -190,18 +290,73 @@ app.get("/api/workspaces/:id/chunks", (req, res) => {
 app.post("/api/sourceChunks/bulk", (req, res) => {
   const chunks = req.body;
   const insert = db.prepare(`
-    INSERT INTO sourceChunks (workspaceId, chapterTitle, chapterIndex, chunkIndex, text, wordCount, characterCount, sourceLocator, importanceScore, createdAt)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO sourceChunks (workspaceId, chapterTitle, chapterIndex, chunkIndex, text, wordCount, characterCount, sourceLocator, importanceScore, embedding, createdAt)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   
   const transaction = db.transaction((data) => {
     for (const chunk of data) {
-      insert.run(chunk.workspaceId, chunk.chapterTitle, chunk.chapterIndex, chunk.chunkIndex, chunk.text, chunk.wordCount, chunk.characterCount, chunk.sourceLocator, chunk.importanceScore, Date.now());
+      insert.run(
+        chunk.workspaceId, 
+        chunk.chapterTitle, 
+        chunk.chapterIndex, 
+        chunk.chunkIndex, 
+        chunk.text, 
+        chunk.wordCount, 
+        chunk.characterCount, 
+        chunk.sourceLocator, 
+        chunk.importanceScore, 
+        chunk.embedding ? JSON.stringify(chunk.embedding) : null,
+        Date.now()
+      );
     }
   });
   
   transaction(chunks);
   res.json({ success: true });
+});
+
+// Semantic Search Endpoint
+app.post("/api/search/semantic", async (req, res) => {
+  try {
+    const { workspaceId, query, limit = 5 } = req.body;
+    
+    // 1. Generate query embedding
+    const embeddings = await generateEmbeddings([query]);
+    const queryVector = embeddings[0];
+
+    // 2. Fetch all chunks for this workspace
+    const chunks = db.prepare("SELECT * FROM sourceChunks WHERE workspaceId = ?").all(workspaceId) as any[];
+    
+    // 3. Compute similarities
+    const scoredChunks = chunks.map(chunk => {
+      if (!chunk.embedding) return { ...chunk, score: 0 };
+      const chunkVector = JSON.parse(chunk.embedding);
+      return {
+        ...chunk,
+        score: cosineSimilarity(queryVector, chunkVector)
+      };
+    });
+
+    // 4. Sort and return
+    scoredChunks.sort((a, b) => b.score - a.score);
+    res.json(scoredChunks.slice(0, limit));
+  } catch (err: any) {
+    console.error("Semantic search error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Embedding Generation Utility Endpoint
+app.post("/api/embeddings/batch", async (req, res) => {
+  try {
+    const { texts } = req.body;
+    const embeddings = await generateEmbeddings(texts);
+    res.json({ embeddings });
+  } catch (err: any) {
+    console.error("Embedding error:", err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Questions
@@ -311,7 +466,7 @@ app.put("/api/questions/:id", (req, res) => {
   const { id } = req.params;
   const updates = req.body;
   
-  const current = db.prepare("SELECT * FROM questions WHERE id = ?").get(id);
+  const current = db.prepare("SELECT * FROM questions WHERE id = ?").get(id) as any;
   if (!current) return res.status(404).json({ error: "Question not found" });
 
   const final = {

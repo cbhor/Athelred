@@ -56,7 +56,8 @@ export default function GenerateSession() {
   const [error, setError] = useState<string | null>(null);
   const [config, setConfig] = useState({
     targetCount: 20,
-    durationMinutes: 60
+    durationMinutes: 60,
+    focusTopic: ''
   });
 
   const [steps, setSteps] = useState<GenStep[]>([
@@ -97,14 +98,45 @@ export default function GenerateSession() {
 
     try {
       const ai = new AIService(apiConfig);
-      
       const targetCount = config.targetCount;
+      
+      // Smart Chunk Selection logic
+      updateStep('prep', 'loading', 'Analyzing knowledge gaps...');
+      let selectedChunks = [];
+
+      if (config.focusTopic.trim()) {
+        // TOPIC FOCUS: Use semantic search
+        updateStep('prep', 'loading', `Searching for "${config.focusTopic}"...`);
+        const semanticResults = await api.search.semantic(workspaceId, config.focusTopic, targetCount * 2);
+        selectedChunks = semanticResults;
+      } else {
+        // COVERAGE FOCUS: Prioritize weak chapters or random coverage
+        const stats = await api.workspaces.getStats(workspaceId);
+        const weakChapters = stats.chapters
+          .filter((c: any) => c.mastery < 70)
+          .map((c: any) => c.name);
+
+        if (weakChapters.length > 0) {
+          const priorityChunks = sourceChunks.filter(c => weakChapters.includes(c.chapterTitle));
+          const otherChunks = sourceChunks.filter(c => !weakChapters.includes(c.chapterTitle));
+          
+          // Mix 70% weak chapters, 30% others for retention
+          const pShuffled = priorityChunks.sort(() => Math.random() - 0.5);
+          const oShuffled = otherChunks.sort(() => Math.random() - 0.5);
+          
+          selectedChunks = [
+            ...pShuffled.slice(0, Math.ceil(targetCount * 1.5)),
+            ...oShuffled.slice(0, Math.ceil(targetCount * 0.5))
+          ];
+        } else {
+          selectedChunks = [...sourceChunks].sort(() => Math.random() - 0.5);
+        }
+      }
+
       const questionsPerBatch = 5;
       const batchesNeeded = Math.ceil(targetCount / questionsPerBatch);
       
-      const shuffledChunks = [...sourceChunks].sort(() => Math.random() - 0.5);
-      
-      updateStep('prep', 'success', `Coverage plan updated`);
+      updateStep('prep', 'success', `Context map constructed (${selectedChunks.length} nodes)`);
       updateStep('ai', 'loading');
 
       const newQuestions: Question[] = [];
@@ -116,12 +148,12 @@ export default function GenerateSession() {
       const cognitiveLevels = ['recall', 'understanding', 'application', 'analysis'];
 
       for (let i = 0; i < batchesNeeded; i++) {
-        updateStep('ai', 'loading', `Generating batch ${i + 1} of ${batchesNeeded}`);
+        updateStep('ai', 'loading', `Synthesizing batch ${i + 1} of ${batchesNeeded}`);
         
-        const startIdx = (i * 2) % shuffledChunks.length;
-        const batchChunks = shuffledChunks.slice(startIdx, Math.min(startIdx + 2, shuffledChunks.length));
+        const startIdx = (i * 2) % selectedChunks.length;
+        const batchChunks = selectedChunks.slice(startIdx, Math.min(startIdx + 2, selectedChunks.length));
         const batchTexts = batchChunks.map(c => c.text);
-        const chapterTitle = batchChunks[0]?.chapterTitle || "Various Sections";
+        const chapterTitle = batchChunks[0]?.chapterTitle || "Multi-section Analysis";
 
         const targetDiff = difficultyOrder[i % difficultyOrder.length];
         const targetCognitive = cognitiveLevels[i % cognitiveLevels.length];
@@ -252,6 +284,23 @@ export default function GenerateSession() {
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-8 mb-12 relative z-10">
+              <div className="md:col-span-2">
+                <label className="block text-[10px] font-mono font-bold text-[#52525B] uppercase tracking-[0.2em] mb-4">
+                  Topic Focus (Optional Semantic Priority)
+                </label>
+                <div className="relative">
+                  <input
+                    type="text"
+                    value={config.focusTopic}
+                    onChange={(e) => setConfig({ ...config, focusTopic: e.target.value })}
+                    placeholder="e.g. neuroplasticity, supply side economics, cellular respiration"
+                    className="w-full px-5 py-4 bg-[#111114] border border-[#3F3F46] rounded-xl text-white outline-none focus:border-white transition-all font-medium placeholder-[#3F3F46]"
+                  />
+                  <div className="absolute right-4 top-1/2 -translate-y-1/2">
+                    <Sparkles className={cn("w-5 h-5 transition-colors", config.focusTopic ? "text-blue-400" : "text-[#3F3F46]")} />
+                  </div>
+                </div>
+              </div>
               <div>
                 <label className="block text-[10px] font-mono font-bold text-[#52525B] uppercase tracking-[0.2em] mb-4">
                   Node Density (Question Count)

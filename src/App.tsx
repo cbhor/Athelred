@@ -141,7 +141,7 @@ function Layout({ children }: { children: React.ReactNode }) {
           <div className="hidden md:flex items-center space-x-8">
             <div className="text-right">
               <p className="text-[10px] uppercase text-[#71717A] tracking-wider font-semibold">Storage Mode</p>
-              <p className="text-xs font-mono text-[#A1A1AA]">IndexedDB Only</p>
+              <p className="text-xs font-mono text-[#A1A1AA]">SQLite + Vector</p>
             </div>
             <div className="text-right">
               <p className="text-[10px] uppercase text-[#71717A] tracking-wider font-semibold">Privacy</p>
@@ -162,7 +162,7 @@ function Layout({ children }: { children: React.ReactNode }) {
               <div className="w-1.5 h-1.5 rounded-full bg-green-500"></div>
               <span>AI Engine Active</span>
             </span>
-            <span className="hidden sm:inline">Browser Database Ready</span>
+            <span className="hidden sm:inline">Server Database Active</span>
           </div>
           <div className="hidden sm:inline uppercase">Aethelred Intelligence // Protocol v1.0</div>
         </footer>

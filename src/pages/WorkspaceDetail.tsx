@@ -15,6 +15,7 @@ import {
   BarChart as BarChartIcon
 } from 'lucide-react';
 import { cn } from '../lib/utils';
+import { Modal } from '../components/Modal';
 import { 
   BarChart as ReBarChart, 
   Bar, 
@@ -57,6 +58,8 @@ export default function WorkspaceDetail() {
     queryFn: () => api.workspaces.getStats(workspaceId)
   });
 
+  const [isDeleteModalOpen, setIsDeleteModalOpen] = React.useState(false);
+
   const deleteMutation = useMutation({
     mutationFn: () => api.workspaces.delete(workspaceId),
     onSuccess: () => {
@@ -77,10 +80,8 @@ export default function WorkspaceDetail() {
     return acc;
   }, {} as Record<string, number>) || {};
 
-  const handleDelete = async () => {
-    if (confirm('Are you sure you want to delete this workspace and all associated questions/sessions?')) {
-      deleteMutation.mutate();
-    }
+  const handleDelete = () => {
+    setIsDeleteModalOpen(true);
   };
 
   if (isLoadingWorkspace || !workspace) {
@@ -401,6 +402,17 @@ export default function WorkspaceDetail() {
           </div>
         </div>
       </div>
+
+      <Modal
+        isOpen={isDeleteModalOpen}
+        onClose={() => setIsDeleteModalOpen(false)}
+        onConfirm={() => deleteMutation.mutate()}
+        title="Purge Workspace"
+        description="Are you sure you want to delete this workspace and all associated questions and sessions? This operation is non-reversible."
+        confirmText="Purge"
+        variant="danger"
+        isLoading={deleteMutation.isPending}
+      />
     </div>
   );
 }
