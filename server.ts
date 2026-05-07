@@ -6,6 +6,7 @@ import Database from "better-sqlite3";
 import cors from "cors";
 import OpenAI from "openai";
 import { GoogleGenerativeAI as GoogleGenAI } from "@google/generative-ai";
+import { GoogleGenAI as GoogleGenAIV2 } from "@google/genai";
 import "dotenv/config";
 
 // Helper to filter out placeholder keys
@@ -51,8 +52,8 @@ const getAI = () => {
 async function generateEmbeddings(texts: string[]): Promise<number[][]> {
   const settings = getSettings();
   const provider = settings.embeddingProvider || 'gemini';
-  const modelName = (settings.embeddingModel || 'text-embedding-004').trim();
-  
+  const modelName = (settings.embeddingModel || 'gemini-embedding-2').trim();
+
   if (provider === 'gemini') {
     const key = [
       settings.embeddingApiKey,
@@ -60,26 +61,25 @@ async function generateEmbeddings(texts: string[]): Promise<number[][]> {
       process.env.EMBEDDING_API_KEY,
       process.env.GEMINI_API_KEY
     ].find(isValidKey)?.trim();
-    
+
     if (!key) throw new Error("Gemini Embedding API Key missing. Please provide one in Settings.");
-    
-    const genAI = new GoogleGenAI(key);
-    const model = genAI.getGenerativeModel({ model: modelName });
-    
-    // Batch process
+
+    const ai = new GoogleGenAIV2({ apiKey: key });
+    const allEmbeddings: number[][] = [];
+
+    // Batch process (API supports batch but we chunk for reliability)
     const batchSize = 25;
-    const allEmbeddings = [];
     for (let i = 0; i < texts.length; i += batchSize) {
       const batch = texts.slice(i, i + batchSize);
       try {
-        const result = await model.batchEmbedContents({
-          requests: batch.map(t => ({ 
-            content: { role: 'user', parts: [{ text: t }] } 
-          }))
+        const response = await ai.models.embedContent({
+          model: modelName,
+          contents: batch,
+          config: { outputDimensionality: 768 }
         });
-        allEmbeddings.push(...result.embeddings.map(e => e.values));
+        allEmbeddings.push(...response.embeddings!.map(e => e.values!));
       } catch (err: any) {
-        console.error(`Gemini Batch Embedding Error (Batch ${i/batchSize}):`, err);
+        console.error(`Gemini Batch Embedding Error (Batch ${Math.floor(i/batchSize)}):`, err);
         throw err;
       }
     }
@@ -225,7 +225,7 @@ db.exec(`
     openaiBaseUrl TEXT,
     selectedModel TEXT,
     embeddingProvider TEXT DEFAULT 'gemini',
-    embeddingModel TEXT DEFAULT 'text-embedding-004',
+    embeddingModel TEXT DEFAULT 'gemini-embedding-2',
     embeddingApiKey TEXT,
     defaultPassPercent INTEGER,
     defaultSessionDurationMinutes INTEGER,
@@ -240,7 +240,7 @@ const hasEmbeddingProvider = settingsTable.some(col => col.name === 'embeddingPr
 if (!hasEmbeddingProvider) {
   try {
     db.prepare("ALTER TABLE settings ADD COLUMN embeddingProvider TEXT DEFAULT 'gemini'").run();
-    db.prepare("ALTER TABLE settings ADD COLUMN embeddingModel TEXT DEFAULT 'text-embedding-004'").run();
+    db.prepare("ALTER TABLE settings ADD COLUMN embeddingModel TEXT DEFAULT 'gemini-embedding-2'").run();
     db.prepare("ALTER TABLE settings ADD COLUMN embeddingApiKey TEXT").run();
   } catch (e) {
     console.error("Migration error (settings):", e);
@@ -266,7 +266,7 @@ if (!checkSettings) {
       id, aiProvider, geminiApiKey, openaiApiKey, openaiBaseUrl, selectedModel, 
       embeddingProvider, embeddingModel, embeddingApiKey,
       defaultPassPercent, defaultSessionDurationMinutes, defaultQuestionCount, allowedOverlapPercent
-    ) VALUES (1, 'gemini', '', '', 'https://api.openai.com/v1', 'gemini-1.5-flash', 'gemini', 'text-embedding-004', '', 60, 180, 100, 30)
+    ) VALUES (1, 'gemini', '', '', 'https://api.openai.com/v1', 'gemini-1.5-flash', 'gemini', 'gemini-embedding-2', '', 60, 180, 100, 30)
   `).run();
 }
 
@@ -662,15 +662,32 @@ app.get("/api/models/embeddings", async (req, res) => {
       const key = [settings.embeddingApiKey, settings.geminiApiKey, process.env.EMBEDDING_API_KEY, process.env.GEMINI_API_KEY]
         .find(isValidKey)?.trim();
       if (!key) throw new Error("Gemini API Key not found.");
-      
-      // The client SDK doesn't expose listModels directly in a simple way
-      // We return a set of known good embedding models
-      const embeddingModels = [
-        { id: 'text-embedding-004', name: 'Text Embedding 004' },
-        { id: 'embedding-001', name: 'Embedding 001' }
-      ];
-      
-      return res.json({ models: embeddingModels });
+
+      try {
+        const ai = new GoogleGenAIV2({ apiKey: key });
+        const pager = await ai.models.list({
+          config: { filter: 'supportedGenerationMethods:embedContent' }
+        });
+
+        const embeddingModels: { id: string; name: string }[] = [];
+        for await (const model of pager) {
+          const modelId = model.name?.replace('models/', '') || '';
+          const displayName = model.displayName || modelId;
+          if (modelId) {
+            embeddingModels.push({ id: modelId, name: displayName });
+          }
+        }
+
+        return res.json({ models: embeddingModels });
+      } catch (listErr: any) {
+        console.error("Gemini list models error, falling back to defaults:", listErr.message);
+        // Fallback to known models if API call fails
+        const fallbackModels = [
+          { id: 'gemini-embedding-2', name: 'Gemini Embedding 2' },
+          { id: 'gemini-embedding-001', name: 'Gemini Embedding 001' }
+        ];
+        return res.json({ models: fallbackModels });
+      }
     } else if (provider === 'openai') {
       const key = settings.embeddingApiKey?.trim() || settings.openaiApiKey?.trim() || process.env.EMBEDDING_API_KEY?.trim() || process.env.OPENAI_API_KEY?.trim();
       if (!key) throw new Error("OpenAI API Key not found.");

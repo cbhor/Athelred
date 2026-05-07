@@ -370,7 +370,7 @@ export default function Settings() {
 
           <div className="grid grid-cols-2 gap-4 mb-10">
             <button
-              onClick={() => handleUpdateSettings({ embeddingProvider: 'gemini', embeddingModel: 'text-embedding-004' })}
+              onClick={() => handleUpdateSettings({ embeddingProvider: 'gemini', embeddingModel: 'gemini-embedding-2' })}
               className={`p-6 rounded-xl border-2 text-left transition-all ${
                 settings.embeddingProvider === 'gemini' 
                   ? 'border-white bg-white/5' 

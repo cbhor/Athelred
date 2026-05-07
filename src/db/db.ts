@@ -131,7 +131,7 @@ export async function initializeSettings() {
         openaiBaseUrl: 'https://api.openai.com/v1',
         selectedModel: 'gemini-1.5-flash',
         embeddingProvider: 'gemini',
-        embeddingModel: 'text-embedding-004',
+        embeddingModel: 'gemini-embedding-2',
         embeddingApiKey: '',
         defaultPassPercent: 60,
         defaultSessionDurationMinutes: 180,
