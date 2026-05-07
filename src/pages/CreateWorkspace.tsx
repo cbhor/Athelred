@@ -21,9 +21,21 @@ export default function CreateWorkspace() {
   const [file, setFile] = useState<File | null>(null);
   const [workspaceName, setWorkspaceName] = useState('');
   const [isParsing, setIsParsing] = useState(false);
+  const [showReview, setShowReview] = useState(false);
+  const [extractedChapters, setExtractedChapters] = useState<{ title: string; text: string; index: number }[]>([]);
+  const [selectedIndices, setSelectedIndices] = useState<Set<number>>(new Set());
+  const [parseContext, setParseContext] = useState<{
+    file: File;
+    metadata: any;
+    hash: string;
+    totalChars: number;
+    totalWords: number;
+  } | null>(null);
+
   const [steps, setSteps] = useState<ParseStep[]>([
     { id: 'file', label: 'Reading file & metadata', status: 'pending' },
     { id: 'extract', label: 'Extracting chapters', status: 'pending' },
+    { id: 'review', label: 'Reviewing detected chapters', status: 'pending' },
     { id: 'chunk', label: 'Processing text chunks', status: 'pending' },
     { id: 'embedding', label: 'Generating semantic vectors', status: 'pending' },
     { id: 'save', label: 'Saving to library', status: 'pending' },
@@ -87,16 +99,27 @@ export default function CreateWorkspace() {
       const spine = (book as any).spine;
       const toc = await book.loaded.navigation;
       
-      // Normalize TOC for easier mapping
-      const tocHrefs = new Set<string>();
-      const tocMap = new Map<string, string>();
+      // Map TOC entries to their respective spine indices and anchors
+      const spineToTocEntries = new Map<number, { label: string; anchor: string | null; depth: number }[]>();
       
-      const flattenToc = (items: any[]) => {
+      const flattenToc = (items: any[], depth: number = 0) => {
         items.forEach(item => {
-          const href = item.href.split('#')[0];
-          tocHrefs.add(href);
-          tocMap.set(href, item.label);
-          if (item.subitems) flattenToc(item.subitems);
+          const parts = item.href.split('#');
+          const anchor = parts[1] || null;
+          
+          // Use epubjs native resolution to find the spine item for this TOC entry
+          const spineItem = book.spine.get(item.href);
+          if (spineItem) {
+            const index = spineItem.index;
+            if (!spineToTocEntries.has(index)) {
+              spineToTocEntries.set(index, []);
+            }
+            spineToTocEntries.get(index)?.push({ label: item.label, anchor, depth });
+          }
+          
+          if (item.subitems && item.subitems.length > 0) {
+            flattenToc(item.subitems, depth + 1);
+          }
         });
       };
       
@@ -104,89 +127,307 @@ export default function CreateWorkspace() {
         flattenToc(toc.toc);
       }
 
-      const segments: { title: string; text: string; href: string; isTocStart: boolean }[] = [];
+      const segments: { title: string; text: string; href: string; isTocStart: boolean; depth: number }[] = [];
       let totalWords = 0;
       let totalChars = 0;
 
+      // Iterate through the spine
       for (let i = 0; i < spine.items.length; i++) {
         const item = spine.items[i];
-        const href = item.href;
-        const normalizedHref = href.startsWith('/') ? href.slice(1) : href;
         
-        const zippedFile = zip.file(normalizedHref) || 
-                          zip.file('OEBPS/' + normalizedHref) || 
-                          zip.file('OPS/' + normalizedHref) ||
-                          zip.file('EPUB/' + normalizedHref);
+        // Skip common metadata files unless they are explicitly in TOC
+        const isMetadataPath = /cover|title|copyright|dedication|acknowledgments|author|preface|contents|toc|nav|about|license|jacket/i.test(item.href);
+        const entries = spineToTocEntries.get(i) || [];
         
-        if (zippedFile) {
-          const content = await zippedFile.async('text');
+        if (isMetadataPath && entries.length === 0) {
+          continue;
+        }
+
+        try {
+          let content = '';
+          
+          // Strategy 1: Look in ZIP (usually most reliable for raw content)
+          // Try multiple path variations
+          const possiblePaths = [
+            item.href,
+            item.path,
+            item.href.replace(/^\//, ''),
+            'OEBPS/' + item.href.replace(/^\//, ''),
+            'OPS/' + item.href.replace(/^\//, ''),
+            'EPUB/' + item.href.replace(/^\//, ''),
+          ].filter(Boolean);
+
+          let zipFile = null;
+          for (const p of possiblePaths) {
+            zipFile = zip.file(p!);
+            if (zipFile) break;
+          }
+
+          if (zipFile) {
+            content = await zipFile.async('text');
+          } else {
+            // Strategy 2: Fallback to epubjs load
+            const doc = await item.load(book.load.bind(book));
+            content = doc.body.innerHTML;
+          }
+
+          if (!content) continue;
+
           const parser = new DOMParser();
           const doc = parser.parseFromString(content, 'text/html');
-          
           const body = doc.body;
+
           if (body) {
+            // Clean undesirable elements
             body.querySelectorAll('script, style, nav, footer, head').forEach(e => e.remove());
-            const text = body.textContent || '';
-            const cleanText = text.replace(/\s+/g, ' ').trim();
             
-            if (cleanText.length > 100) {
-              const isTocStart = tocHrefs.has(href) || tocHrefs.has(normalizedHref);
-              const title = tocMap.get(href) || tocMap.get(normalizedHref) || doc.querySelector('h1, h2, h3, title')?.textContent?.trim() || `Section ${i + 1}`;
-              
-              segments.push({
-                title,
-                text: cleanText,
-                href,
-                isTocStart
+            if (entries.length > 1 && entries.some(e => e.anchor)) {
+              // Internal splitting based on anchors
+              const anchorPoints = entries.map(e => ({
+                label: e.label,
+                element: e.anchor ? doc.getElementById(e.anchor) || doc.querySelector(`[name="${e.anchor}"]`) : body,
+                depth: e.depth,
+                anchor: e.anchor
+              })).filter(ap => ap.element);
+
+              const sortedAnchors = anchorPoints.sort((a, b) => {
+                if (a.element === b.element) return 0;
+                return (a.element!.compareDocumentPosition(b.element!) & Node.DOCUMENT_POSITION_FOLLOWING) ? -1 : 1;
               });
+
+              for (let j = 0; j < sortedAnchors.length; j++) {
+                const current = sortedAnchors[j];
+                const next = sortedAnchors[j + 1];
+                
+                const container = doc.createElement('div');
+                let node: Node | null = current.element;
+                
+                if (node && node !== body) {
+                  container.appendChild(node.cloneNode(true));
+                  let nextSib: Node | null = node.nextSibling;
+                  while (nextSib && nextSib !== next?.element) {
+                    container.appendChild(nextSib.cloneNode(true));
+                    nextSib = nextSib.nextSibling;
+                  }
+                } else {
+                  container.textContent = body.textContent;
+                }
+
+                const text = container.textContent || '';
+                const cleanText = text.replace(/\s+/g, ' ').trim();
+                
+                if (cleanText.length > 30) {
+                  segments.push({
+                    title: current.label,
+                    text: cleanText,
+                    href: `${item.href}${current.anchor ? '#' + current.anchor : ''}`,
+                    isTocStart: true,
+                    depth: current.depth
+                  });
+                  totalChars += cleanText.length;
+                  totalWords += cleanText.split(/\s+/).length;
+                }
+              }
+            } else {
+              // Single segment file
+              const text = body.textContent || '';
+              const cleanText = text.replace(/\s+/g, ' ').trim();
               
-              totalChars += cleanText.length;
-              totalWords += cleanText.split(/\s+/).length;
+              if (cleanText.length > 30) {
+                const isTocStart = entries.length > 0;
+                
+                // Smarter title selection
+                const bookTitle = metadata.title?.trim();
+                let title = entries[0]?.label;
+                
+                const isValidTitle = (t?: string) => {
+                  if (!t) return false;
+                  const clean = t.trim();
+                  // More rigorous check: avoid titles that match book title EXACTLY or are contained in it too simply
+                  if (!clean || clean.length < 2 || clean.length > 150) return false;
+                  if (clean.toLowerCase() === bookTitle?.toLowerCase()) return false;
+                  
+                  // Ignore common generic page labels like "Page 1", "Untitled"
+                  if (/^(page|section|chapter)\s+\d+$/i.test(clean)) return true; // keep these as fallbacks
+                  
+                  return true;
+                };
+
+                if (!isValidTitle(title)) {
+                  // Fallback to headers in the document, but avoid the book title
+                  const headers = Array.from(doc.querySelectorAll('h1, h2, h3, h4, h5'));
+                  for (const h of headers) {
+                    const hText = h.textContent?.trim();
+                    if (isValidTitle(hText)) {
+                      title = hText;
+                      break;
+                    }
+                  }
+                }
+                
+                // Final fallbacks - avoid using the book title as a segment title
+                if (!isValidTitle(title)) {
+                  // Try first substantive paragraph if it looks like a sub-header (e.g. bold or all caps)
+                  const p = doc.querySelector('p b, p strong, p.chapter-title, p.section-title');
+                  if (p && isValidTitle(p.textContent?.trim())) {
+                    title = p.textContent?.trim();
+                  } else if (isValidTitle(entries[0]?.label)) {
+                    title = entries[0]?.label;
+                  } else {
+                    const docTitle = doc.querySelector('title')?.textContent?.trim();
+                    if (isValidTitle(docTitle)) {
+                      title = docTitle;
+                    } else {
+                      title = `Section ${i + 1}`;
+                    }
+                  }
+                }
+                
+                segments.push({
+                  title: title || `Section ${i + 1}`,
+                  text: cleanText,
+                  href: item.href,
+                  isTocStart,
+                  depth: entries[0]?.depth ?? 99
+                });
+                
+                totalChars += cleanText.length;
+                totalWords += cleanText.split(/\s+/).length;
+              }
             }
           }
+        } catch (err) {
+          console.warn(`Failed to load spine item ${item.href}:`, err);
+          continue;
         }
       }
 
-      // Merge segments into actual chapters based on TOC markers
+      // Merge segments into actual chapters
       const chapters: { title: string; text: string; index: number }[] = [];
       
       segments.forEach((segment, idx) => {
-        // Skip metadata segments
-        const isMetadata = /cover|title|copyright|dedication|acknowledgments|author|preface/i.test(segment.title) || 
-                          (segment.text.length < 500 && idx < 3);
+        const isMetadataTitle = /cover|title|copyright|dedication|acknowledgments|author|preface|contents|toc|about|license|jacket|jacket/i.test(segment.title);
+        const isNewFile = idx > 0 && segments[idx-1].href.split('#')[0] !== segment.href.split('#')[0];
+        
+        // A segment starts a new chapter if:
+        // 1. It's the first segment
+        // 2. It's a TOC start at a reasonable depth (0, 1, or 2)
+        // 3. It's a new file with significant content that isn't metadata
+        let isRealNewChapter = false;
+        
+        if (chapters.length === 0) {
+          isRealNewChapter = true;
+        } else if (segment.isTocStart) {
+          // If it's in the TOC, we generally want it as a chapter boundary unless it's deep metadata
+          if (segment.depth <= 2) {
+            isRealNewChapter = true;
+          } else if (segment.text.length > 800 && !isMetadataTitle) {
+            isRealNewChapter = true;
+          }
+        } else if (isNewFile && segment.text.length > 2000 && !isMetadataTitle) {
+          // Substantial new file without a TOC entry - likely a chapter the TOC missed or grouped
+          isRealNewChapter = true;
+        }
 
-        if (isMetadata && !segment.isTocStart) return;
-
-        if (segment.isTocStart || chapters.length === 0) {
+        if (isRealNewChapter) {
           chapters.push({
             title: segment.title,
             text: segment.text,
             index: chapters.length
           });
         } else {
-          // Append to current chapter
           const last = chapters[chapters.length - 1];
-          last.text += "\n\n" + segment.text;
+          if (last) {
+            last.text += "\n\n" + segment.text;
+          } else {
+            chapters.push({
+              title: segment.title,
+              text: segment.text,
+              index: 0
+            });
+          }
         }
       });
 
-      // Cleanup: Final pass to ensure titles are clean
-      const finalChapters = chapters.map((c, i) => ({
-        ...c,
-        title: c.title.length > 60 ? `Chapter ${i + 1}` : c.title
-      })).filter(c => c.text.split(/\s+/).length > 100); // Remove tiny placeholder chapters
+      // Cleanup: Final pass to ensure titles are clean and non-chapters are filtered
+      let finalChapters = chapters.map((c, i) => {
+        let cleanTitle = c.title.replace(/\s+/g, ' ').trim();
+        // If title is just a number or too long, format it
+        if (!cleanTitle || cleanTitle.length > 100 || /^\d+$/.test(cleanTitle)) {
+          cleanTitle = cleanTitle ? `Chapter ${cleanTitle}` : `Chapter ${i + 1}`;
+        }
+        return {
+          ...c,
+          title: cleanTitle
+        };
+      }).filter(c => {
+        const wordCount = c.text.split(/\s+/).length;
+        const isMetadata = /cover|title|copyright|dedication|acknowledgments|author|preface|contents|toc|about|license|jacket/i.test(c.title);
+        // We keep it if it's substantive (> 200 words)
+        // OR if it's a medium-sized real content section (> 50 words and not metadata)
+        return wordCount > 200 || (wordCount > 50 && !isMetadata);
+      });
+
+      // Deduplicate titles if the logic yielded identical names for multiple chapters
+      const titleCounts = new Map<string, number>();
+      finalChapters.forEach(c => {
+        titleCounts.set(c.title, (titleCounts.get(c.title) || 0) + 1);
+      });
+
+      const seenSoFar = new Map<string, number>();
+      finalChapters = finalChapters.map((c) => {
+        const count = titleCounts.get(c.title) || 0;
+        if (count > 1) {
+          const seen = (seenSoFar.get(c.title) || 0) + 1;
+          seenSoFar.set(c.title, seen);
+          return { ...c, title: `${c.title} (Part ${seen})` };
+        }
+        return c;
+      });
 
       if (finalChapters.length === 0) {
         throw new Error('No readable text found in EPUB.');
       }
 
       updateStep('extract', 'success', `${finalChapters.length} chapters identified`);
-      updateStep('chunk', 'loading');
+      
+      setExtractedChapters(finalChapters);
+      setSelectedIndices(new Set(finalChapters.map((_, i) => i)));
+      setParseContext({
+        file,
+        metadata,
+        hash,
+        totalChars,
+        totalWords
+      });
+      setShowReview(true);
+      updateStep('review', 'loading');
+
+    } catch (err: any) {
+      console.error(err);
+      setError(err.message || 'An error occurred while parsing the EPUB.');
+      setIsParsing(false);
+    }
+  }
+
+  async function finalizeWorkspace() {
+    if (!parseContext) return;
+    
+    setError(null);
+    updateStep('review', 'success', `${selectedIndices.size} selected`);
+    updateStep('chunk', 'loading');
+
+    try {
+      const filteredChapters = extractedChapters.filter((_, i) => selectedIndices.has(i));
+      
+      if (filteredChapters.length === 0) {
+        throw new Error('Please select at least one chapter.');
+      }
 
       const chunksData: any[] = [];
       const CHUNK_SIZE = 2500;
 
-      finalChapters.forEach((chapter, chapterIdx) => {
+      filteredChapters.forEach((chapter, chapterIdx) => {
         const words = chapter.text.split(/\s+/);
         let chunkIdx = 0;
         
@@ -225,13 +466,13 @@ export default function CreateWorkspace() {
         name: workspaceName,
         createdAt: Date.now(),
         updatedAt: Date.now(),
-        epubFileName: file.name,
-        epubTitle: metadata.title || 'Unknown Title',
-        epubAuthor: metadata.creator || 'Unknown Author',
-        epubHash: hash,
-        totalCharacters: totalChars,
-        totalWords: totalWords,
-        chapterCount: finalChapters.length,
+        epubFileName: parseContext.file.name,
+        epubTitle: parseContext.metadata.title || 'Unknown Title',
+        epubAuthor: parseContext.metadata.creator || 'Unknown Author',
+        epubHash: parseContext.hash,
+        totalCharacters: parseContext.totalChars,
+        totalWords: parseContext.totalWords,
+        chapterCount: filteredChapters.length,
         chunkCount: chunksData.length,
         status: 'ready',
         parseWarnings: []
@@ -249,6 +490,90 @@ export default function CreateWorkspace() {
       setError(err.message || 'An error occurred while parsing the EPUB.');
       setIsParsing(false);
     }
+  }
+
+  if (showReview) {
+    return (
+      <div className="max-w-4xl mx-auto py-10">
+        <div className="mb-10 flex items-center justify-between">
+          <div>
+            <h1 className="text-4xl font-serif text-white italic">Knowledge Selection</h1>
+            <p className="text-[#71717A] mt-2 font-medium italic">Select the segments to include in the intelligence mapping.</p>
+          </div>
+          <div className="bg-[#1D1D21] px-5 py-3 rounded-xl border border-white/5">
+            <span className="text-[10px] font-mono text-[#52525B] uppercase tracking-[0.2em] block mb-1">Targeting</span>
+            <span className="text-xl font-serif text-white italic">{selectedIndices.size} / {extractedChapters.length} Clusters</span>
+          </div>
+        </div>
+
+        <div className="card-dark p-0 bg-[#111114] overflow-hidden">
+          <div className="max-h-[60vh] overflow-y-auto p-8 space-y-3">
+            {extractedChapters.map((chapter, idx) => (
+              <div 
+                key={idx} 
+                onClick={() => {
+                  const s = new Set(selectedIndices);
+                  if (s.has(idx)) s.delete(idx);
+                  else s.add(idx);
+                  setSelectedIndices(s);
+                }}
+                className={cn(
+                  "flex items-center gap-6 p-5 rounded-xl border transition-all cursor-pointer group",
+                  selectedIndices.has(idx) 
+                    ? "bg-white/[0.03] border-white/10" 
+                    : "bg-transparent border-[#27272A] opacity-50 grayscale hover:grayscale-0 hover:opacity-100"
+                )}
+              >
+                <div className={cn(
+                  "w-6 h-6 rounded flex items-center justify-center border transition-colors",
+                  selectedIndices.has(idx) ? "bg-white border-white" : "border-[#3F3F46]"
+                )}>
+                  {selectedIndices.has(idx) && <CheckCircle2 className="w-4 h-4 text-black" />}
+                </div>
+                <div className="flex-1">
+                  <h4 className="font-serif italic text-white text-lg">{chapter.title}</h4>
+                  <p className="text-[10px] font-mono text-[#52525B] uppercase tracking-wider mt-1 italic">
+                    {chapter.text.split(/\s+/).length} Words • {chapter.text.length} Characters
+                  </p>
+                </div>
+                <span className="text-[10px] font-mono text-[#3F3F46] group-hover:text-[#52525B] transition-colors uppercase tracking-widest font-bold">
+                  Cluster {idx + 1}
+                </span>
+              </div>
+            ))}
+          </div>
+
+          <div className="p-8 bg-[#18181B] border-t border-white/[0.03] flex items-center justify-between gap-6">
+            <div className="flex gap-4">
+              <button 
+                onClick={() => setSelectedIndices(new Set(extractedChapters.map((_, i) => i)))}
+                className="text-[11px] font-bold text-[#A1A1AA] hover:text-white uppercase tracking-widest"
+              >
+                Select All
+              </button>
+              <button 
+                onClick={() => setSelectedIndices(new Set())}
+                className="text-[11px] font-bold text-[#A1A1AA] hover:text-white uppercase tracking-widest"
+              >
+                Deselect All
+              </button>
+            </div>
+            {error && <p className="text-xs text-red-400 font-medium italic">{error}</p>}
+            <button
+              onClick={() => {
+                setShowReview(false);
+                finalizeWorkspace();
+              }}
+              disabled={selectedIndices.size === 0}
+              className="btn-primary-v2 px-10 h-14 bg-white hover:bg-gray-200 disabled:opacity-50"
+            >
+              Analyze Selection & Construct
+              <ArrowRight className="w-5 h-5 ml-2" />
+            </button>
+          </div>
+        </div>
+      </div>
+    );
   }
 
   return (

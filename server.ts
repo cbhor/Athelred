@@ -5,11 +5,27 @@ import fs from "fs";
 import Database from "better-sqlite3";
 import cors from "cors";
 import OpenAI from "openai";
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { GoogleGenerativeAI as GoogleGenAI } from "@google/generative-ai";
+import "dotenv/config";
+
+// Helper to filter out placeholder keys
+const isValidKey = (key?: any) => {
+  if (typeof key !== 'string') return false;
+  const k = key.trim();
+  return k.length > 5 && 
+         k !== "YOUR_API_KEY" && 
+         k !== "undefined" && 
+         k !== "null" &&
+         !k.includes(' ');
+};
 
 // AI Utilities
 const getSettings = () => {
-  return db.prepare("SELECT * FROM settings WHERE id = 1").get() as any;
+  try {
+    return db.prepare("SELECT * FROM settings WHERE id = 1").get() as any;
+  } catch (e) {
+    return {};
+  }
 };
 
 const getAI = () => {
@@ -17,47 +33,71 @@ const getAI = () => {
   const provider = settings.aiProvider || 'gemini';
   
   if (provider === 'gemini') {
-    const key = settings.geminiApiKey?.trim() || process.env.GEMINI_API_KEY?.trim();
-    if (!key) throw new Error("Gemini API Key not configured.");
-    return new GoogleGenerativeAI(key);
+    const key = [settings.geminiApiKey, process.env.GEMINI_API_KEY]
+      .find(isValidKey)?.trim();
+    if (!key) throw new Error("Gemini API Key missing or invalid. Please check your settings.");
+    return new GoogleGenAI(key);
   } else {
-    const key = settings.openaiApiKey?.trim() || process.env.OPENAI_API_KEY?.trim();
-    if (!key) throw new Error("OpenAI API Key not configured.");
+    const key = [settings.openaiApiKey, process.env.OPENAI_API_KEY]
+      .find(isValidKey)?.trim();
+    if (!key) throw new Error("OpenAI-format API Key missing. Please check your settings.");
     return new OpenAI({
       apiKey: key,
-      baseURL: settings.openaiBaseUrl || undefined
+      baseURL: (settings.openaiBaseUrl || "").trim() || undefined
     });
   }
 };
 
 async function generateEmbeddings(texts: string[]): Promise<number[][]> {
   const settings = getSettings();
-  const provider = settings.embeddingProvider || process.env.EMBEDDING_PROVIDER || 'gemini';
-  const modelName = settings.embeddingModel || process.env.EMBEDDING_MODEL || 'embedding-001';
+  const provider = settings.embeddingProvider || 'gemini';
+  const modelName = (settings.embeddingModel || 'text-embedding-004').trim();
   
   if (provider === 'gemini') {
-    const key = settings.embeddingApiKey?.trim() || settings.geminiApiKey?.trim() || process.env.EMBEDDING_API_KEY?.trim() || process.env.GEMINI_API_KEY?.trim();
-    if (!key) throw new Error("Gemini Embedding API Key not found.");
+    const key = [
+      settings.embeddingApiKey,
+      settings.geminiApiKey,
+      process.env.EMBEDDING_API_KEY,
+      process.env.GEMINI_API_KEY
+    ].find(isValidKey)?.trim();
     
-    const genAI = new GoogleGenerativeAI(key);
+    if (!key) throw new Error("Gemini Embedding API Key missing. Please provide one in Settings.");
+    
+    const genAI = new GoogleGenAI(key);
     const model = genAI.getGenerativeModel({ model: modelName });
     
     // Batch process
-    const batchSize = 20;
+    const batchSize = 25;
     const allEmbeddings = [];
     for (let i = 0; i < texts.length; i += batchSize) {
       const batch = texts.slice(i, i + batchSize);
-      const result = await model.batchEmbedContents({
-        requests: batch.map((t: string) => ({ content: { role: "user", parts: [{ text: t }] }, taskType: "RETRIEVAL_DOCUMENT" as any }))
-      });
-      allEmbeddings.push(...result.embeddings.map(e => e.values));
+      try {
+        const result = await model.batchEmbedContents({
+          requests: batch.map(t => ({ 
+            content: { role: 'user', parts: [{ text: t }] } 
+          }))
+        });
+        allEmbeddings.push(...result.embeddings.map(e => e.values));
+      } catch (err: any) {
+        console.error(`Gemini Batch Embedding Error (Batch ${i/batchSize}):`, err);
+        throw err;
+      }
     }
     return allEmbeddings;
   } else if (provider === 'openai') {
-    const key = settings.embeddingApiKey?.trim() || settings.openaiApiKey?.trim() || process.env.EMBEDDING_API_KEY?.trim() || process.env.OPENAI_API_KEY?.trim();
-    if (!key) throw new Error("OpenAI Embedding API Key not found.");
+    const key = [
+      settings.embeddingApiKey,
+      settings.openaiApiKey,
+      process.env.EMBEDDING_API_KEY,
+      process.env.OPENAI_API_KEY
+    ].find(isValidKey)?.trim();
     
-    const openai = new OpenAI({ apiKey: key, baseURL: settings.openaiBaseUrl || undefined });
+    if (!key) throw new Error("OpenAI Embedding API Key missing.");
+    
+    const openai = new OpenAI({ 
+      apiKey: key, 
+      baseURL: (settings.openaiBaseUrl || "").trim() || undefined 
+    });
     const response = await openai.embeddings.create({
       model: modelName || 'text-embedding-3-small',
       input: texts,
@@ -185,7 +225,7 @@ db.exec(`
     openaiBaseUrl TEXT,
     selectedModel TEXT,
     embeddingProvider TEXT DEFAULT 'gemini',
-    embeddingModel TEXT DEFAULT 'embedding-001',
+    embeddingModel TEXT DEFAULT 'text-embedding-004',
     embeddingApiKey TEXT,
     defaultPassPercent INTEGER,
     defaultSessionDurationMinutes INTEGER,
@@ -200,10 +240,21 @@ const hasEmbeddingProvider = settingsTable.some(col => col.name === 'embeddingPr
 if (!hasEmbeddingProvider) {
   try {
     db.prepare("ALTER TABLE settings ADD COLUMN embeddingProvider TEXT DEFAULT 'gemini'").run();
-    db.prepare("ALTER TABLE settings ADD COLUMN embeddingModel TEXT DEFAULT 'embedding-001'").run();
+    db.prepare("ALTER TABLE settings ADD COLUMN embeddingModel TEXT DEFAULT 'text-embedding-004'").run();
     db.prepare("ALTER TABLE settings ADD COLUMN embeddingApiKey TEXT").run();
   } catch (e) {
-    console.error("Migration error:", e);
+    console.error("Migration error (settings):", e);
+  }
+}
+
+// Migration: Ensure embedding column exists in sourceChunks
+const chunksTable = db.prepare("PRAGMA table_info(sourceChunks)").all() as any[];
+const hasChunkEmbedding = chunksTable.some(col => col.name === 'embedding');
+if (!hasChunkEmbedding) {
+  try {
+    db.prepare("ALTER TABLE sourceChunks ADD COLUMN embedding TEXT").run();
+  } catch (e) {
+    console.error("Migration error (sourceChunks):", e);
   }
 }
 
@@ -215,7 +266,7 @@ if (!checkSettings) {
       id, aiProvider, geminiApiKey, openaiApiKey, openaiBaseUrl, selectedModel, 
       embeddingProvider, embeddingModel, embeddingApiKey,
       defaultPassPercent, defaultSessionDurationMinutes, defaultQuestionCount, allowedOverlapPercent
-    ) VALUES (1, 'gemini', '', '', 'https://api.openai.com/v1', 'gemini-1.5-flash', 'gemini', 'embedding-001', '', 60, 180, 100, 30)
+    ) VALUES (1, 'gemini', '', '', 'https://api.openai.com/v1', 'gemini-1.5-flash', 'gemini', 'text-embedding-004', '', 60, 180, 100, 30)
   `).run();
 }
 
@@ -600,6 +651,44 @@ app.put("/api/sessions/:id", (req, res) => {
   }
 
   res.json({ success: true });
+});
+
+app.get("/api/models/embeddings", async (req, res) => {
+  try {
+    const settings = getSettings();
+    const provider = req.query.provider || settings.embeddingProvider || 'gemini';
+    
+    if (provider === 'gemini') {
+      const key = [settings.embeddingApiKey, settings.geminiApiKey, process.env.EMBEDDING_API_KEY, process.env.GEMINI_API_KEY]
+        .find(isValidKey)?.trim();
+      if (!key) throw new Error("Gemini API Key not found.");
+      
+      // The client SDK doesn't expose listModels directly in a simple way
+      // We return a set of known good embedding models
+      const embeddingModels = [
+        { id: 'text-embedding-004', name: 'Text Embedding 004' },
+        { id: 'embedding-001', name: 'Embedding 001' }
+      ];
+      
+      return res.json({ models: embeddingModels });
+    } else if (provider === 'openai') {
+      const key = settings.embeddingApiKey?.trim() || settings.openaiApiKey?.trim() || process.env.EMBEDDING_API_KEY?.trim() || process.env.OPENAI_API_KEY?.trim();
+      if (!key) throw new Error("OpenAI API Key not found.");
+      
+      const openai = new OpenAI({ apiKey: key, baseURL: settings.openaiBaseUrl || undefined });
+      const response = await openai.models.list();
+      const embeddingModels = response.data
+        .filter(m => m.id.includes('embed'))
+        .map(m => ({ id: m.id, name: m.id }));
+      
+      return res.json({ models: embeddingModels });
+    }
+    
+    res.status(400).json({ error: "Unsupported provider" });
+  } catch (err: any) {
+    console.error("Fetch models error:", err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Vite Middleware

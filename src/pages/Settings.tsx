@@ -1,7 +1,7 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { api } from '../lib/api';
-import { Key, Eye, EyeOff, Save, Download, Upload, Trash2, CheckCircle2, AlertCircle, Globe, Cpu } from 'lucide-react';
+import { Key, Eye, EyeOff, Save, Download, Upload, Trash2, CheckCircle2, AlertCircle, Globe, Cpu, RefreshCw, Loader2 } from 'lucide-react';
 import { AIService } from '../services/aiService';
 import { Modal } from '../components/Modal';
 
@@ -15,6 +15,9 @@ export default function Settings() {
   const [showKey, setShowKey] = useState(false);
   const [testStatus, setTestStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle');
   const [testMessage, setTestMessage] = useState('');
+  const [embeddingModels, setEmbeddingModels] = useState<{id: string, name: string}[]>([]);
+  const [fetchModelsStatus, setFetchModelsStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle');
+  const [fetchModelsError, setFetchModelsError] = useState('');
   const [modalConfig, setModalConfig] = useState<{
     isOpen: boolean;
     title: string;
@@ -39,6 +42,34 @@ export default function Settings() {
   const handleUpdateSettings = (updates: any) => {
     updateSettingsMutation.mutate({ ...settings, ...updates });
   };
+
+  const fetchEmbeddingModels = async (provider?: string) => {
+    if (!settings) return;
+    const targetProvider = provider || settings.embeddingProvider;
+    setFetchModelsStatus('loading');
+    setFetchModelsError('');
+    try {
+      const response = await fetch(`/api/models/embeddings?provider=${targetProvider}`);
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.error || 'Failed to fetch models');
+      }
+      const data = await response.json();
+      setEmbeddingModels(data.models);
+      setFetchModelsStatus('success');
+    } catch (err: any) {
+      console.error("Fetch models error:", err);
+      setFetchModelsStatus('error');
+      setFetchModelsError(err.message);
+      setEmbeddingModels([]);
+    }
+  };
+
+  useEffect(() => {
+    if (settings?.embeddingProvider) {
+      fetchEmbeddingModels(settings.embeddingProvider);
+    }
+  }, [settings?.embeddingProvider]);
 
   const handleTestKey = async () => {
     if (!settings) return;
@@ -339,7 +370,7 @@ export default function Settings() {
 
           <div className="grid grid-cols-2 gap-4 mb-10">
             <button
-              onClick={() => handleUpdateSettings({ embeddingProvider: 'gemini', embeddingModel: 'embedding-001' })}
+              onClick={() => handleUpdateSettings({ embeddingProvider: 'gemini', embeddingModel: 'text-embedding-004' })}
               className={`p-6 rounded-xl border-2 text-left transition-all ${
                 settings.embeddingProvider === 'gemini' 
                   ? 'border-white bg-white/5' 
@@ -382,18 +413,46 @@ export default function Settings() {
             </div>
 
             <div>
-              <label className="block text-[10px] font-mono font-bold text-[#52525B] uppercase tracking-[0.2em] mb-3">
-                Embedding Vector Model
-              </label>
+              <div className="flex items-center justify-between mb-3">
+                <label className="block text-[10px] font-mono font-bold text-[#52525B] uppercase tracking-[0.2em]">
+                  Embedding Vector Model
+                </label>
+                <button 
+                  onClick={() => fetchEmbeddingModels()}
+                  className="text-[10px] text-indigo-400 font-mono uppercase font-bold flex items-center gap-1 hover:text-indigo-300 transition-colors"
+                >
+                  {fetchModelsStatus === 'loading' ? (
+                    <Loader2 className="w-3 h-3 animate-spin" />
+                  ) : (
+                    <RefreshCw className="w-3 h-3" />
+                  )}
+                  Refresh Models
+                </button>
+              </div>
               <div className="relative">
-                <input
-                  type="text"
+                <select
                   value={settings.embeddingModel}
                   onChange={(e) => handleUpdateSettings({ embeddingModel: e.target.value })}
-                  placeholder={settings.embeddingProvider === 'gemini' ? 'embedding-001' : 'text-embedding-3-small'}
-                  className="w-full px-5 py-4 bg-[#18181B] border border-[#3F3F46] rounded-xl text-white outline-none focus:border-white transition-all font-medium"
-                />
+                  className="w-full px-5 py-4 bg-[#18181B] border border-[#3F3F46] rounded-xl text-white outline-none focus:border-white appearance-none transition-all font-medium"
+                >
+                  {embeddingModels.length > 0 ? (
+                    embeddingModels.map(m => (
+                      <option key={m.id} value={m.id}>{m.name}</option>
+                    ))
+                  ) : (
+                    <option value={settings.embeddingModel}>{settings.embeddingModel} (Current)</option>
+                  )}
+                </select>
+                <div className="absolute right-5 top-1/2 -translate-y-1/2 pointer-events-none text-[#71717A]">
+                  <Cpu className="w-4 h-4" />
+                </div>
               </div>
+              {fetchModelsStatus === 'error' && (
+                <p className="mt-3 text-xs text-rose-400 font-mono uppercase tracking-widest">{fetchModelsError}</p>
+              )}
+              {fetchModelsStatus === 'success' && embeddingModels.length === 0 && (
+                <p className="mt-3 text-xs text-[#71717A] italic">No compatible embedding models found with current key.</p>
+              )}
             </div>
           </div>
         </section>

@@ -16,7 +16,10 @@ import {
   BarChart,
   ArrowRight,
   Clock,
-  Target
+  Target,
+  Layers,
+  ChevronDown,
+  ChevronUp
 } from 'lucide-react';
 
 interface GenStep {
@@ -52,13 +55,23 @@ export default function GenerateSession() {
     queryFn: () => api.workspaces.getQuestions(workspaceId)
   });
 
+  const { data: stats } = useQuery({
+    queryKey: ['stats', workspaceId],
+    queryFn: () => api.workspaces.getStats(workspaceId)
+  });
+
   const [isGenerating, setIsGenerating] = useState(false);
+  const [showChapters, setShowChapters] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [config, setConfig] = useState({
     targetCount: 20,
     durationMinutes: 60,
-    focusTopic: ''
+    focusTopic: '',
+    useChapterSelection: false
   });
+
+  const [selectedChapters, setSelectedChapters] = useState<Set<string>>(new Set());
+  const [chapterWeights, setChapterWeights] = useState<Record<string, number>>({});
 
   const [steps, setSteps] = useState<GenStep[]>([
     { id: 'prep', label: 'Analyzing source content', status: 'pending' },
@@ -109,10 +122,25 @@ export default function GenerateSession() {
         updateStep('prep', 'loading', `Searching for "${config.focusTopic}"...`);
         const semanticResults = await api.search.semantic(workspaceId, config.focusTopic, targetCount * 2);
         selectedChunks = semanticResults;
+      } else if (config.useChapterSelection && selectedChapters.size > 0) {
+        // CHAPTER SELECTION + WEIGHTAGE
+        updateStep('prep', 'loading', 'Balancing chapter clusters...');
+        const activeChapters = Array.from(selectedChapters);
+        const totalWeight = activeChapters.reduce((sum: number, name: string) => sum + (Number(chapterWeights[name]) || 1), 0);
+        
+        activeChapters.forEach(chapName => {
+          const weight = Number(chapterWeights[chapName]) || 1;
+          const chapTarget = Math.ceil((Number(weight) / (Number(totalWeight) || 1)) * Number(config.targetCount) * 2); 
+          const chapChunks = sourceChunks?.filter(c => c.chapterTitle === chapName).sort(() => Math.random() - 0.5) || [];
+          selectedChunks.push(...chapChunks.slice(0, chapTarget));
+        });
+        
+        // Shuffle everything to avoid batch bias
+        selectedChunks.sort(() => Math.random() - 0.5);
       } else {
         // COVERAGE FOCUS: Prioritize weak chapters or random coverage
-        const stats = await api.workspaces.getStats(workspaceId);
-        const weakChapters = stats.chapters
+        const currentStats = stats || await api.workspaces.getStats(workspaceId);
+        const weakChapters = currentStats.chapters
           .filter((c: any) => c.mastery < 70)
           .map((c: any) => c.name);
 
@@ -285,21 +313,118 @@ export default function GenerateSession() {
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-8 mb-12 relative z-10">
               <div className="md:col-span-2">
-                <label className="block text-[10px] font-mono font-bold text-[#52525B] uppercase tracking-[0.2em] mb-4">
-                  Topic Focus (Optional Semantic Priority)
-                </label>
-                <div className="relative">
-                  <input
-                    type="text"
-                    value={config.focusTopic}
-                    onChange={(e) => setConfig({ ...config, focusTopic: e.target.value })}
-                    placeholder="e.g. neuroplasticity, supply side economics, cellular respiration"
-                    className="w-full px-5 py-4 bg-[#111114] border border-[#3F3F46] rounded-xl text-white outline-none focus:border-white transition-all font-medium placeholder-[#3F3F46]"
-                  />
-                  <div className="absolute right-4 top-1/2 -translate-y-1/2">
-                    <Sparkles className={cn("w-5 h-5 transition-colors", config.focusTopic ? "text-blue-400" : "text-[#3F3F46]")} />
+                <div className="flex items-center justify-between mb-4">
+                  <label className="block text-[10px] font-mono font-bold text-[#52525B] uppercase tracking-[0.2em]">
+                    Focus Strategy
+                  </label>
+                  <div className="flex gap-4">
+                    <button 
+                      onClick={() => setConfig({ ...config, useChapterSelection: false })}
+                      className={cn(
+                        "text-[10px] font-mono font-bold uppercase tracking-widest px-3 py-1 rounded transition-all",
+                        !config.useChapterSelection ? "bg-white text-black" : "text-[#52525B] hover:text-[#71717A]"
+                      )}
+                    >
+                      Semantic / Auto
+                    </button>
+                    <button 
+                      onClick={() => {
+                        setConfig({ ...config, useChapterSelection: true });
+                        if (selectedChapters.size === 0 && stats) {
+                          setSelectedChapters(new Set(stats.chapters.map(c => c.name)));
+                        }
+                      }}
+                      className={cn(
+                        "text-[10px] font-mono font-bold uppercase tracking-widest px-3 py-1 rounded transition-all",
+                        config.useChapterSelection ? "bg-white text-black" : "text-[#52525B] hover:text-[#71717A]"
+                      )}
+                    >
+                      Cluster Selection
+                    </button>
                   </div>
                 </div>
+
+                {!config.useChapterSelection ? (
+                  <div className="relative">
+                    <input
+                      type="text"
+                      value={config.focusTopic}
+                      onChange={(e) => setConfig({ ...config, focusTopic: e.target.value })}
+                      placeholder="e.g. neuroplasticity, supply side economics, cellular respiration"
+                      className="w-full px-5 py-4 bg-[#111114] border border-[#3F3F46] rounded-xl text-white outline-none focus:border-white transition-all font-medium placeholder-[#3F3F46]"
+                    />
+                    <div className="absolute right-4 top-1/2 -translate-y-1/2">
+                      <Sparkles className={cn("w-5 h-5 transition-colors", config.focusTopic ? "text-blue-400" : "text-[#3F3F46]")} />
+                    </div>
+                  </div>
+                ) : (
+                  <div className="bg-[#111114] border border-[#3F3F46] rounded-xl overflow-hidden">
+                    <button 
+                      onClick={() => setShowChapters(!showChapters)}
+                      className="w-full px-5 py-4 flex items-center justify-between text-white hover:bg-white/[0.02] transition-colors"
+                    >
+                      <div className="flex items-center gap-3">
+                        <Layers className="w-4 h-4 text-[#71717A]" />
+                        <span className="font-medium italic">{selectedChapters.size} Knowledge Clusters Targeted</span>
+                      </div>
+                      {showChapters ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+                    </button>
+                    
+                    {(showChapters || selectedChapters.size > 0) && (
+                      <div className={cn("p-5 pt-0 space-y-2", !showChapters && "hidden")}>
+                        <div className="flex gap-4 mb-4 pb-4 border-b border-white/[0.03]">
+                          <button 
+                            onClick={() => setSelectedChapters(new Set(stats?.chapters.map(c => c.name) || []))}
+                            className="text-[9px] font-mono font-bold text-[#52525B] hover:text-white uppercase tracking-widest"
+                          >
+                            All
+                          </button>
+                          <button 
+                            onClick={() => setSelectedChapters(new Set())}
+                            className="text-[9px] font-mono font-bold text-[#52525B] hover:text-white uppercase tracking-widest"
+                          >
+                            None
+                          </button>
+                        </div>
+                        <div className="grid grid-cols-1 gap-2 max-h-60 overflow-y-auto pr-2 custom-scrollbar">
+                          {stats?.chapters.map((chap, idx) => (
+                            <div key={idx} className="flex items-center gap-4 group">
+                              <button 
+                                onClick={() => {
+                                  const s = new Set(selectedChapters);
+                                  if (s.has(chap.name)) s.delete(chap.name);
+                                  else s.add(chap.name);
+                                  setSelectedChapters(s);
+                                }}
+                                className={cn(
+                                  "flex-1 text-left px-4 py-2.5 rounded-lg border transition-all text-xs font-medium italic",
+                                  selectedChapters.has(chap.name) 
+                                    ? "bg-white/5 border-white/10 text-white" 
+                                    : "border-[#27272A] text-[#52525B] hover:border-[#3F3F46]"
+                                )}
+                              >
+                                {chap.name}
+                              </button>
+                              {selectedChapters.has(chap.name) && (
+                                <div className="flex items-center gap-3 bg-[#1D1D21] px-3 py-1 rounded-lg border border-white/5 shrink-0">
+                                  <span className="text-[10px] font-mono text-[#52525B] uppercase font-bold">Weight</span>
+                                  <input 
+                                    type="number" 
+                                    min="1" 
+                                    max="10"
+                                    value={chapterWeights[chap.name] || 1}
+                                    onChange={(e) => setChapterWeights({ ...chapterWeights, [chap.name]: Number(e.target.value) })}
+                                    className="w-8 bg-transparent text-white text-xs font-mono outline-none text-center"
+                                  />
+                                </div>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
               <div>
                 <label className="block text-[10px] font-mono font-bold text-[#52525B] uppercase tracking-[0.2em] mb-4">

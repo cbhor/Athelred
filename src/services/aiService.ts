@@ -38,10 +38,15 @@ export class AIService {
   constructor(config: AIServiceConfig) {
     this.config = config;
     if (config.provider === 'gemini') {
-      this.geminiAi = new GoogleGenAI({ apiKey: config.geminiApiKey! });
+      const key = config.geminiApiKey || (typeof process !== 'undefined' ? process.env?.GEMINI_API_KEY : '');
+      if (!key) {
+        console.warn("Gemini API Key missing in AIService config and environment.");
+      }
+      this.geminiAi = new GoogleGenAI({ apiKey: key || 'not-configured' });
     } else {
+      const key = config.openaiApiKey || (typeof process !== 'undefined' ? process.env?.OPENAI_API_KEY : 'not-needed');
       this.openaiAi = new OpenAI({
-        apiKey: config.openaiApiKey || 'not-needed',
+        apiKey: key,
         baseURL: config.openaiBaseUrl,
         dangerouslyAllowBrowser: true
       });
